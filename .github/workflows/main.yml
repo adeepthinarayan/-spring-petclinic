@@ -161,28 +161,146 @@ jobs:
 
           PORT_FORWARD_PID=$!
 
+          trap 'kill "$PORT_FORWARD_PID" 2>/dev/null || true' EXIT
+
           for i in {1..30}; do
             if curl -fsS http://localhost:8080/ -o /dev/null; then
               echo "Spring PetClinic is responding successfully."
               exit 0
             fi
 
-            if ! kill -0 "$PORT_FORWARD_PID" 2>/dev/null; then
-              echo "Port-forward process stopped unexpectedly."
-              cat /tmp/port-forward.log
-              exit 1
+            sleep 5
+          done
+
+          echo "Application did not respond."
+          cat /tmp/port-forward.log
+          sudo k3s kubectl get pods -o wide
+          sudo k3s kubectl logs deployment/spring-petclinic \
+            --all-pods=true --tail=100 || true
+
+          exit 1
+
+      # ==========================================
+      # CLOUDFLARE TUNNEL
+      # ==========================================
+
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -L --fail --show-error \
+            -o cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+          sudo dpkg -i cloudflared.deb
+
+          cloudflared --version
+
+      - name: Start Cloudflare Tunnel
+        run: |
+          echo "Starting Kubernetes port-forward..."
+
+          SERVICE_PORT=$(sudo k3s kubectl get service spring-petclinic-service \
+            -o jsonpath='{.spec.ports[0].port}')
+
+          if [ -z "$SERVICE_PORT" ]; then
+            echo "Could not determine Kubernetes Service port."
+            exit 1
+          fi
+
+          nohup sudo k3s kubectl port-forward \
+            service/spring-petclinic-service \
+            8080:${SERVICE_PORT} \
+            --address 127.0.0.1 \
+            >/tmp/cloudflare-port-forward.log 2>&1 </dev/null &
+
+          echo "Waiting for local application endpoint..."
+
+          LOCAL_READY=false
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8080/ -o /dev/null; then
+              LOCAL_READY=true
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "$LOCAL_READY" != "true" ]; then
+            echo "Local application endpoint is unavailable."
+            cat /tmp/cloudflare-port-forward.log
+            exit 1
+          fi
+
+          echo "Starting Cloudflare Tunnel..."
+
+          nohup cloudflared tunnel \
+            --url http://localhost:8080 \
+            --no-autoupdate \
+            >/tmp/cloudflared.log 2>&1 </dev/null &
+
+          echo "Waiting for public HTTPS URL..."
+
+          TUNNEL_URL=""
+
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log | head -n 1 || true)
+
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Cloudflare Tunnel failed to start."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "PUBLIC_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+
+          echo "## Public Application URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "[$TUNNEL_URL]($TUNNEL_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Public URL: $TUNNEL_URL"
+
+      - name: Verify Public Application Access
+        run: |
+          echo "Testing public application URL..."
+
+          for i in {1..12}; do
+            if curl -fsS "$PUBLIC_URL/" -o /dev/null; then
+              echo "Public application access successful."
+              exit 0
             fi
 
             sleep 5
           done
 
-          echo "Application did not respond."
-
-          cat /tmp/port-forward.log
-
-          sudo k3s kubectl get pods -o wide
-
-          sudo k3s kubectl logs deployment/spring-petclinic \
-            --all-pods=true --tail=100 || true
-
+          echo "Public application access failed."
+          cat /tmp/cloudflared.log
+          cat /tmp/cloudflare-port-forward.log
           exit 1
+
+      - name: Keep Application Available for 2 Minutes
+        run: |
+          echo "Public URL: $PUBLIC_URL"
+          echo "Keeping application available for 2 minutes..."
+
+          sleep 120
+
+          echo "Demo period completed."
+
+      - name: CD Summary
+        if: success()
+        run: |
+          echo "## CD Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- K3s cluster created successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Application deployed to Kubernetes." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kubernetes rollout verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Application response verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public HTTPS access verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cloudflare Tunnel available for 2 minutes." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public URL: $PUBLIC_URL" >> "$GITHUB_STEP_SUMMARY"
